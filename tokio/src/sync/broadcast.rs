@@ -226,6 +226,38 @@ pub mod error {
 
     impl<T: fmt::Debug> std::error::Error for SendError<T> {}
 
+    /// Error returned by the [`send_non_lagging`] function on a [`Sender`].
+    ///
+    /// Unlike [`send`], this function can fail either if there are no active receivers
+    /// or if there are pending message on any active receiver such that calling [`send`]
+    /// would cause their [`recv`] method to return [`Lagged`].
+    ///
+    /// [`send_non_lagging`]: crate::sync::broadcast::Sender::send_non_lagging
+    /// [`Sender`]: crate::sync::broadcast::Sender
+    /// [`send`]: crate::sync::broadcast::Sender::send
+    /// [`recv`]: crate::sync::broadcast::Receiver::recv
+    /// [`Lagged`]: crate::sync::broadcast::error::RecvError::Lagged
+    #[derive(Debug, PartialEq)]
+    pub enum NonLaggingSendError<T> {
+        /// There are no active receivers.
+        ///
+        /// This variant is equivalent to [`SendError`].
+        NoReceivers(T),
+        /// A receiver has not read a message yet and sending this value would overwrite it.
+        WouldLag(T),
+    }
+
+    impl<T> fmt::Display for NonLaggingSendError<T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                NonLaggingSendError::NoReceivers(_) => write!(f, "channel closed"),
+                NonLaggingSendError::WouldLag(_) => write!(f, "channel contains unread values"),
+            }
+        }
+    }
+
+    impl<T: fmt::Debug> std::error::Error for NonLaggingSendError<T> {}
+
     /// An error returned from the [`recv`] function on a [`Receiver`].
     ///
     /// [`recv`]: crate::sync::broadcast::Receiver::recv
@@ -537,8 +569,81 @@ impl<T> Sender<T> {
     /// }
     /// ```
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
-        self.send2(Some(value))
-            .map_err(|SendError(maybe_v)| SendError(maybe_v.unwrap()))
+        self.send2(Some(value), false).map_err(|err| match err {
+            NonLaggingSendError::NoReceivers(t) => SendError(t.unwrap()),
+            NonLaggingSendError::WouldLag(_) => {
+                unreachable!("send2 can't return WouldLag when fail_if_lagged is false")
+            }
+        })
+    }
+
+    /// A variation of [`send`] that fails if it would cause a future call to [`recv`] to return [`Lagged`].
+    ///
+    /// This risks introducing the "slow receiver" problem, forcing all other receivers to wait while
+    /// a single slow receiver blocks the channel. As such, this method should be avoided unless ensuring all
+    /// values are seen by all receivers is essential.
+    ///
+    /// To send the message after the slowest receiver has caught up, use an external synchronization
+    /// method (e.g. a [`Notify`]), as shown in the example.
+    ///
+    /// For further information, see [`send`].
+    ///
+    /// # Examples
+    ///
+    /// This example uses a [`Notify`] after a task that takes a long time to reawaken the main thread,
+    /// which re-sends the value.
+    ///
+    /// ```
+    /// use tokio::sync::broadcast;
+    /// use tokio::sync::Notify;
+    /// use tokio::time::{sleep, Duration};
+    ///
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let (tx, mut rx1) = broadcast::channel(1);
+    ///     let mut rx2 = tx.subscribe();
+    ///     let notify = Arc::new(Notify::new());
+    ///     let notify2 = notify.clone();
+    ///
+    ///     tokio::spawn(async move {
+    ///         // A "fast" receiver
+    ///         assert_eq!(rx1.recv().await.unwrap(), 10);
+    ///         assert_eq!(rx1.recv().await.unwrap(), 20);
+    ///     });
+    ///
+    ///     tokio::spawn(async move {
+    ///         // A "slow" receiver
+    ///         assert_eq!(rx2.recv().await.unwrap(), 10);
+    ///         sleep(Duration::from_secs(3)).await;
+    ///         notify2.notify_one();
+    ///         assert_eq!(rx2.recv().await.unwrap(), 20);
+    ///     });
+    ///
+    ///     tx.send_non_lagging(10).unwrap();
+    ///     assert_eq!(
+    ///         tx.send_non_lagging(20),
+    ///         Err(broadcast::error::NonLaggingSendError::WouldLag(20))
+    ///     );
+    ///     notify.notified().await;
+    ///     tx.send_non_lagging(20).unwrap();
+    /// }
+    ///
+    /// ```
+    ///
+    /// [`Sender`]: crate::sync::broadcast::Sender
+    /// [`send`]: crate::sync::broadcast::Sender::send
+    /// [`recv`]: crate::sync::broadcast::Receiver::recv
+    /// [`Lagged`]: crate::sync::broadcast::error::RecvError::Lagged
+    /// [`Notify`]: crate::sync::Notify
+    pub fn send_non_lagging(&self, value: T) -> Result<usize, NonLaggingSendError<T>> {
+        self.send2(Some(value), true).map_err(|err| match err {
+            NonLaggingSendError::NoReceivers(value) => {
+                NonLaggingSendError::NoReceivers(value.unwrap())
+            }
+            NonLaggingSendError::WouldLag(value) => NonLaggingSendError::WouldLag(value.unwrap()),
+        })
     }
 
     /// Creates a new [`Receiver`] handle that will receive values sent **after**
@@ -610,11 +715,15 @@ impl<T> Sender<T> {
         tail.rx_cnt
     }
 
-    fn send2(&self, value: Option<T>) -> Result<usize, SendError<Option<T>>> {
+    fn send2(
+        &self,
+        value: Option<T>,
+        fail_if_lagged: bool,
+    ) -> Result<usize, NonLaggingSendError<Option<T>>> {
         let mut tail = self.shared.tail.lock();
 
         if tail.rx_cnt == 0 {
-            return Err(SendError(value));
+            return Err(NonLaggingSendError::NoReceivers(value));
         }
 
         // Position to write into
@@ -622,11 +731,15 @@ impl<T> Sender<T> {
         let rem = tail.rx_cnt;
         let idx = (pos & self.shared.mask as u64) as usize;
 
-        // Update the tail position
-        tail.pos = tail.pos.wrapping_add(1);
-
         // Get the slot
         let mut slot = self.shared.buffer[idx].write().unwrap();
+
+        if fail_if_lagged && *slot.rem.get_mut() > 0 {
+            return Err(NonLaggingSendError::WouldLag(value));
+        }
+
+        // Update the tail position
+        tail.pos = tail.pos.wrapping_add(1);
 
         // Track the position
         slot.pos = pos;
@@ -700,7 +813,7 @@ impl<T> Clone for Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if 1 == self.shared.num_tx.fetch_sub(1, SeqCst) {
-            let _ = self.send2(None);
+            let _ = self.send2(None, false);
         }
     }
 }
